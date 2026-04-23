@@ -19,6 +19,11 @@
 #include <rocksdb/utilities/options_util.h>
 #include <rocksdb/write_batch.h>
 
+#include <unistd.h>
+#include <cinttypes>
+#include <cstdio>
+#include <algorithm>
+
 namespace {
   const std::string PROP_NAME = "rocksdb.dbname";
   const std::string PROP_NAME_DEFAULT = "";
@@ -107,6 +112,23 @@ namespace {
   const std::string PROP_SYNC = "rocksdb.sync";
   const std::string PROP_SYNC_DEFAULT = "false";
 
+  // rocksdb.per_op_db=true  — open+close the DB around every single operation.
+  // Enables multi-thread benchmarking against a shared on-disk DB path without
+  // keeping a persistent handle.  Much slower than the default shared-handle
+  // mode; that overhead is the quantity being measured.
+  const std::string PROP_PER_OP_DB = "rocksdb.per_op_db";
+  const std::string PROP_PER_OP_DB_DEFAULT = "false";
+
+  // Maximum number of times to retry DB::Open when the LOCK file is held by
+  // another thread.  Each retry uses exponential backoff starting at
+  // rocksdb.per_op_db_retry_base_us microseconds, capped at 64 ms.
+  const std::string PROP_PER_OP_DB_MAX_RETRIES = "rocksdb.per_op_db_max_retries";
+  const std::string PROP_PER_OP_DB_MAX_RETRIES_DEFAULT = "100";
+
+  // Initial sleep duration (µs) before the first retry on lock contention.
+  const std::string PROP_PER_OP_DB_RETRY_BASE_US = "rocksdb.per_op_db_retry_base_us";
+  const std::string PROP_PER_OP_DB_RETRY_BASE_US_DEFAULT = "1000";
+
   static std::shared_ptr<rocksdb::Env> env_guard;
   static std::shared_ptr<rocksdb::Cache> block_cache;
 #if ROCKSDB_MAJOR < 8
@@ -121,6 +143,11 @@ rocksdb::DB *RocksdbDB::db_ = nullptr;
 int RocksdbDB::ref_cnt_ = 0;
 std::mutex RocksdbDB::mu_;
 rocksdb::WriteOptions RocksdbDB::wopt_;
+
+rocksdb::Options RocksdbDB::shared_opt_;
+std::vector<rocksdb::ColumnFamilyDescriptor> RocksdbDB::shared_cf_descs_;
+bool RocksdbDB::per_op_opts_ready_ = false;
+std::atomic<uint64_t> RocksdbDB::total_lock_retries_{0};
 
 void RocksdbDB::Init() {
 // merge operator disabled by default due to link error
@@ -171,16 +198,30 @@ void RocksdbDB::Init() {
   const std::string format = props.GetProperty(PROP_FORMAT, PROP_FORMAT_DEFAULT);
   if (format == "single") {
     format_ = kSingleRow;
-    method_read_ = &RocksdbDB::ReadSingle;
-    method_scan_ = &RocksdbDB::ScanSingle;
-    method_update_ = &RocksdbDB::UpdateSingle;
-    method_insert_ = &RocksdbDB::InsertSingle;
-    method_delete_ = &RocksdbDB::DeleteSingle;
+    if (props.GetProperty(PROP_PER_OP_DB, PROP_PER_OP_DB_DEFAULT) == "true") {
+      per_op_db_enabled_ = true;
+      method_read_   = &RocksdbDB::ReadPerOp;
+      method_scan_   = &RocksdbDB::ScanPerOp;
+      method_update_ = &RocksdbDB::UpdatePerOp;
+      method_insert_ = &RocksdbDB::InsertPerOp;
+      method_delete_ = &RocksdbDB::DeletePerOp;
 #ifdef USE_MERGEUPDATE
-    if (props.GetProperty(PROP_MERGEUPDATE, PROP_MERGEUPDATE_DEFAULT) == "true") {
-      method_update_ = &RocksdbDB::MergeSingle;
-    }
+      if (props.GetProperty(PROP_MERGEUPDATE, PROP_MERGEUPDATE_DEFAULT) == "true") {
+        method_update_ = &RocksdbDB::MergePerOp;
+      }
 #endif
+    } else {
+      method_read_   = &RocksdbDB::ReadSingle;
+      method_scan_   = &RocksdbDB::ScanSingle;
+      method_update_ = &RocksdbDB::UpdateSingle;
+      method_insert_ = &RocksdbDB::InsertSingle;
+      method_delete_ = &RocksdbDB::DeleteSingle;
+#ifdef USE_MERGEUPDATE
+      if (props.GetProperty(PROP_MERGEUPDATE, PROP_MERGEUPDATE_DEFAULT) == "true") {
+        method_update_ = &RocksdbDB::MergeSingle;
+      }
+#endif
+    }
   } else {
     throw utils::Exception("unknown format");
   }
@@ -188,13 +229,45 @@ void RocksdbDB::Init() {
                                             CoreWorkload::FIELD_COUNT_DEFAULT));
 
   ref_cnt_++;
-  if (db_) {
-    return;
-  }
 
   const std::string &db_path = props.GetProperty(PROP_NAME, PROP_NAME_DEFAULT);
   if (db_path == "") {
     throw utils::Exception("RocksDB db path is missing");
+  }
+
+  if (per_op_db_enabled_) {
+    per_op_db_path_ = db_path;
+    per_op_max_retries_ = std::stoi(
+        props.GetProperty(PROP_PER_OP_DB_MAX_RETRIES, PROP_PER_OP_DB_MAX_RETRIES_DEFAULT));
+    per_op_retry_base_us_ = std::stoi(
+        props.GetProperty(PROP_PER_OP_DB_RETRY_BASE_US, PROP_PER_OP_DB_RETRY_BASE_US_DEFAULT));
+
+    // Build the options template exactly once (first thread); subsequent
+    // threads copy the already-constructed shared_opt_ / shared_cf_descs_.
+    if (!per_op_opts_ready_) {
+      shared_opt_.create_if_missing = true;
+      GetOptions(props, &shared_opt_, &shared_cf_descs_);
+#ifdef USE_MERGEUPDATE
+      shared_opt_.merge_operator.reset(new YCSBUpdateMerge);
+#endif
+      if (props.GetProperty(PROP_DESTROY, PROP_DESTROY_DEFAULT) == "true") {
+        rocksdb::Status s = rocksdb::DestroyDB(db_path, shared_opt_);
+        if (!s.ok()) {
+          throw utils::Exception(std::string("RocksDB DestroyDB: ") + s.ToString());
+        }
+      }
+      per_op_opts_ready_ = true;
+    }
+
+    // Each thread gets its own copy; shared_ptr members (table_factory,
+    // merge_operator, block_cache, env) are reference-counted and safe to share.
+    per_op_opt_ = shared_opt_;
+    per_op_cf_descs_ = shared_cf_descs_;
+    return;  // no persistent DB handle in this mode
+  }
+
+  if (db_) {
+    return;
   }
 
   rocksdb::Options opt;
@@ -222,19 +295,135 @@ void RocksdbDB::Init() {
   }
 }
 
-void RocksdbDB::Cleanup() { 
+void RocksdbDB::Cleanup() {
   const std::lock_guard<std::mutex> lock(mu_);
   if (--ref_cnt_) {
     return;
   }
+  uint64_t retries = total_lock_retries_.load(std::memory_order_relaxed);
+  if (retries > 0) {
+    fprintf(stderr,
+            "RocksDB per-op mode: %" PRIu64 " total lock-contention retries across all threads\n",
+            retries);
+  }
+  per_op_opts_ready_ = false;
   for (size_t i = 0; i < cf_handles_.size(); i++) {
     if (cf_handles_[i] != nullptr) {
       db_->DestroyColumnFamilyHandle(cf_handles_[i]);
       cf_handles_[i] = nullptr;
     }
   }
-  delete db_;
+  if (db_) {
+    delete db_;
+    db_ = nullptr;
+  }
 }
+
+// ---------------------------------------------------------------------------
+// Per-op DB open / close
+// ---------------------------------------------------------------------------
+
+// Returns true if a failed DB::Open status represents LOCK-file contention
+// from another holder (vs. a genuine error we should surface immediately).
+static bool IsLockContention(const rocksdb::Status &s) {
+  if (!s.IsIOError()) return false;
+  const std::string msg = s.ToString();
+  // RocksDB lock-error messages contain the word "LOCK" (the filename) or
+  // "lock hold by current process".
+  return msg.find("LOCK") != std::string::npos ||
+         msg.find("lock hold") != std::string::npos;
+}
+
+void RocksdbDB::OpenPerOpDB() {
+  int sleep_us = per_op_retry_base_us_;
+  for (int attempt = 0; ; attempt++) {
+    rocksdb::Status s;
+    if (per_op_cf_descs_.empty()) {
+      s = rocksdb::DB::Open(per_op_opt_, per_op_db_path_, &local_db_);
+    } else {
+      s = rocksdb::DB::Open(per_op_opt_, per_op_db_path_,
+                            per_op_cf_descs_, &local_cf_handles_, &local_db_);
+    }
+    if (s.ok()) {
+      return;
+    }
+    if (IsLockContention(s) && attempt < per_op_max_retries_) {
+      total_lock_retries_.fetch_add(1, std::memory_order_relaxed);
+      usleep(static_cast<useconds_t>(sleep_us));
+      sleep_us = std::min(sleep_us * 2, 64000);  // exponential backoff, cap 64 ms
+      continue;
+    }
+    throw utils::Exception(std::string("RocksDB Open (per-op): ") + s.ToString());
+  }
+}
+
+void RocksdbDB::ClosePerOpDB() {
+  if (!local_db_) return;
+  for (auto *h : local_cf_handles_) {
+    local_db_->DestroyColumnFamilyHandle(h);
+  }
+  local_cf_handles_.clear();
+  rocksdb::Status s = local_db_->Close();
+  if (!s.ok()) {
+    fprintf(stderr, "RocksDB Close (per-op): %s\n", s.ToString().c_str());
+  }
+  delete local_db_;
+  local_db_ = nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Per-op dispatch wrappers: open → delegate to *Single → close.
+// Exception safety: ClosePerOpDB is called in both the success and the throw
+// paths so the DB handle is never leaked.
+// ---------------------------------------------------------------------------
+
+#define PER_OP_WRAP(call)          \
+  OpenPerOpDB();                   \
+  try {                            \
+    auto s = (call);               \
+    ClosePerOpDB();                \
+    return s;                      \
+  } catch (...) {                  \
+    ClosePerOpDB();                \
+    throw;                         \
+  }
+
+DB::Status RocksdbDB::ReadPerOp(const std::string &table, const std::string &key,
+                                const std::vector<std::string> *fields,
+                                std::vector<Field> &result) {
+  PER_OP_WRAP(ReadSingle(table, key, fields, result));
+}
+
+DB::Status RocksdbDB::ScanPerOp(const std::string &table, const std::string &key, int len,
+                                const std::vector<std::string> *fields,
+                                std::vector<std::vector<Field>> &result) {
+  PER_OP_WRAP(ScanSingle(table, key, len, fields, result));
+}
+
+DB::Status RocksdbDB::UpdatePerOp(const std::string &table, const std::string &key,
+                                  std::vector<Field> &values) {
+  PER_OP_WRAP(UpdateSingle(table, key, values));
+}
+
+DB::Status RocksdbDB::MergePerOp(const std::string &table, const std::string &key,
+                                 std::vector<Field> &values) {
+  PER_OP_WRAP(MergeSingle(table, key, values));
+}
+
+DB::Status RocksdbDB::InsertPerOp(const std::string &table, const std::string &key,
+                                  std::vector<Field> &values) {
+  PER_OP_WRAP(InsertSingle(table, key, values));
+}
+
+DB::Status RocksdbDB::DeletePerOp(const std::string &table, const std::string &key) {
+  PER_OP_WRAP(DeleteSingle(table, key));
+}
+
+#undef PER_OP_WRAP
+
+// ---------------------------------------------------------------------------
+// Options parsing
+// ---------------------------------------------------------------------------
 
 void RocksdbDB::GetOptions(const utils::Properties &props, rocksdb::Options *opt,
                            std::vector<rocksdb::ColumnFamilyDescriptor> *cf_descs) {
@@ -242,11 +431,22 @@ void RocksdbDB::GetOptions(const utils::Properties &props, rocksdb::Options *opt
   std::string fs_uri = props.GetProperty(PROP_FS_URI, PROP_FS_URI_DEFAULT);
   rocksdb::Env* env =  rocksdb::Env::Default();;
   if (!env_uri.empty() || !fs_uri.empty()) {
+#if ROCKSDB_MAJOR > 6 || (ROCKSDB_MAJOR == 6 && ROCKSDB_MINOR >= 22)
     rocksdb::Status s = rocksdb::Env::CreateFromUri(rocksdb::ConfigOptions(),
                                                     env_uri, fs_uri, &env, &env_guard);
     if (!s.ok()) {
       throw utils::Exception(std::string("RocksDB CreateFromUri: ") + s.ToString());
     }
+#else
+    // RocksDB < 6.22 does not have Env::CreateFromUri; fs_uri is unsupported.
+    if (!fs_uri.empty()) {
+      throw utils::Exception("rocksdb.fs_uri requires RocksDB >= 6.22");
+    }
+    rocksdb::Status s = rocksdb::Env::LoadEnv(env_uri, &env, &env_guard);
+    if (!s.ok()) {
+      throw utils::Exception(std::string("RocksDB LoadEnv: ") + s.ToString());
+    }
+#endif
     opt->env = env;
   }
 
@@ -374,6 +574,10 @@ void RocksdbDB::GetOptions(const utils::Properties &props, rocksdb::Options *opt
   }
 }
 
+// ---------------------------------------------------------------------------
+// Serialization helpers
+// ---------------------------------------------------------------------------
+
 void RocksdbDB::SerializeRow(const std::vector<Field> &values, std::string &data) {
   for (const Field &field : values) {
     uint32_t len = field.name.size();
@@ -434,11 +638,15 @@ void RocksdbDB::DeserializeRow(std::vector<Field> &values, const std::string &da
   DeserializeRow(values, p, lim);
 }
 
+// ---------------------------------------------------------------------------
+// Core single-row operations — all use ActiveDB() so they work in both modes.
+// ---------------------------------------------------------------------------
+
 DB::Status RocksdbDB::ReadSingle(const std::string &table, const std::string &key,
                                  const std::vector<std::string> *fields,
                                  std::vector<Field> &result) {
   std::string data;
-  rocksdb::Status s = db_->Get(rocksdb::ReadOptions(), key, &data);
+  rocksdb::Status s = ActiveDB()->Get(rocksdb::ReadOptions(), key, &data);
   if (s.IsNotFound()) {
     return kNotFound;
   } else if (!s.ok()) {
@@ -456,7 +664,7 @@ DB::Status RocksdbDB::ReadSingle(const std::string &table, const std::string &ke
 DB::Status RocksdbDB::ScanSingle(const std::string &table, const std::string &key, int len,
                                  const std::vector<std::string> *fields,
                                  std::vector<std::vector<Field>> &result) {
-  rocksdb::Iterator *db_iter = db_->NewIterator(rocksdb::ReadOptions());
+  rocksdb::Iterator *db_iter = ActiveDB()->NewIterator(rocksdb::ReadOptions());
   db_iter->Seek(key);
   for (int i = 0; db_iter->Valid() && i < len; i++) {
     std::string data = db_iter->value().ToString();
@@ -477,7 +685,7 @@ DB::Status RocksdbDB::ScanSingle(const std::string &table, const std::string &ke
 DB::Status RocksdbDB::UpdateSingle(const std::string &table, const std::string &key,
                                    std::vector<Field> &values) {
   std::string data;
-  rocksdb::Status s = db_->Get(rocksdb::ReadOptions(), key, &data);
+  rocksdb::Status s = ActiveDB()->Get(rocksdb::ReadOptions(), key, &data);
   if (s.IsNotFound()) {
     return kNotFound;
   } else if (!s.ok()) {
@@ -500,7 +708,7 @@ DB::Status RocksdbDB::UpdateSingle(const std::string &table, const std::string &
 
   data.clear();
   SerializeRow(current_values, data);
-  s = db_->Put(wopt_, key, data);
+  s = ActiveDB()->Put(wopt_, key, data);
   if (!s.ok()) {
     throw utils::Exception(std::string("RocksDB Put: ") + s.ToString());
   }
@@ -511,7 +719,7 @@ DB::Status RocksdbDB::MergeSingle(const std::string &table, const std::string &k
                                   std::vector<Field> &values) {
   std::string data;
   SerializeRow(values, data);
-  rocksdb::Status s = db_->Merge(wopt_, key, data);
+  rocksdb::Status s = ActiveDB()->Merge(wopt_, key, data);
   if (!s.ok()) {
     throw utils::Exception(std::string("RocksDB Merge: ") + s.ToString());
   }
@@ -522,7 +730,7 @@ DB::Status RocksdbDB::InsertSingle(const std::string &table, const std::string &
                                    std::vector<Field> &values) {
   std::string data;
   SerializeRow(values, data);
-  rocksdb::Status s = db_->Put(wopt_, key, data);
+  rocksdb::Status s = ActiveDB()->Put(wopt_, key, data);
   if (!s.ok()) {
     throw utils::Exception(std::string("RocksDB Put: ") + s.ToString());
   }
@@ -530,7 +738,7 @@ DB::Status RocksdbDB::InsertSingle(const std::string &table, const std::string &
 }
 
 DB::Status RocksdbDB::DeleteSingle(const std::string &table, const std::string &key) {
-  rocksdb::Status s = db_->Delete(wopt_, key);
+  rocksdb::Status s = ActiveDB()->Delete(wopt_, key);
   if (!s.ok()) {
     throw utils::Exception(std::string("RocksDB Delete: ") + s.ToString());
   }

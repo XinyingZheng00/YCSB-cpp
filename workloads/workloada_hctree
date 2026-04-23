@@ -1,0 +1,33 @@
+# YCSB workload for HCTree write-heavy benchmarking.
+#
+# Mirrors the spirit of ~/hctree/doc/hctree/perftest1.tcl "update1" test:
+#   - Large pre-populated dataset (1 M rows)
+#   - 50 % point-reads / 50 % single-row updates, Zipfian key distribution
+#   - 10 fields × 100 bytes each ≈ 1 KB records
+#
+# For a pure-update workload (closest to perftest1 update1) set:
+#   readproportion=0
+#   updateproportion=1
+#
+# Load phase (inserts only — always used for load):
+#   ./ycsb -db sqlite -load -P workloads/workloada_hctree -P sqlite/hctree.properties \
+#           -p threadcount=1 -p operationcount=1000000 -p recordcount=1000000
+
+recordcount=1000000
+operationcount=1000000
+
+workload=com.yahoo.ycsb.workloads.CoreWorkload
+
+readallfields=true
+fieldcount=10
+fieldlength=100
+
+# 50 / 50 read–update (workload A).  To test pure write throughput, comment
+# out readproportion and set updateproportion=1.
+readproportion=0.5
+updateproportion=0.5
+scanproportion=0
+insertproportion=0
+
+# Zipfian matches the default SQLite / HCTree workload in perftest1.tcl.
+requestdistribution=zipfian

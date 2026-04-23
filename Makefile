@@ -17,6 +17,12 @@ BIND_ROCKSDB ?= 0
 BIND_LMDB ?= 0
 BIND_SQLITE ?= 0
 
+# HCTree: use HCTree's own libsqlite3 instead of the system one.
+# Requires BIND_SQLITE=1 as well.
+# HCTREE_BLD_DIR defaults to ~/hctree/bld (set by build_hctree.sh).
+BIND_HCTREE ?= 0
+HCTREE_BLD_DIR ?= $(HOME)/hctree/bld
+
 # Extra options
 DEBUG_BUILD ?=
 EXTRA_CXXFLAGS ?=
@@ -57,8 +63,19 @@ ifeq ($(BIND_LMDB), 1)
 endif
 
 ifeq ($(BIND_SQLITE), 1)
-	LDFLAGS += -lsqlite3
+	CPPFLAGS += -DUSE_SQLITE
 	SOURCES += $(wildcard sqlite/*.cc)
+ifeq ($(BIND_HCTREE), 1)
+	# Point the compiler at HCTree's sqlite3.h before any system headers.
+	CXXFLAGS += -I$(HCTREE_BLD_DIR)
+	# Propagate the same compile-time defines used when building the library.
+	CPPFLAGS += -DSQLITE_SHARED_MAPPING=1 -DSQLITE_DEFAULT_MEMSTATUS=0 \
+	            -DSQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS=1
+	# Link against the static HCTree library; -ldl and -lm are required by SQLite.
+	LDFLAGS  += $(HCTREE_BLD_DIR)/libsqlite3_hctree.a -ldl -lm
+else
+	LDFLAGS += -lsqlite3
+endif
 endif
 
 CXXFLAGS += -std=c++17 -Wall -pthread $(EXTRA_CXXFLAGS) -I./

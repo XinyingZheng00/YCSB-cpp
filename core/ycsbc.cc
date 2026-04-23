@@ -21,6 +21,9 @@
 #include "core_workload.h"
 #include "db_factory.h"
 #include "measurements.h"
+#ifdef USE_SQLITE
+#include "../sqlite/sqlite_db.h"
+#endif
 #include "utils/countdown_latch.h"
 #include "utils/rate_limit.h"
 #include "utils/timer.h"
@@ -141,7 +144,9 @@ int main(const int argc, const char *argv[]) {
       }
 
       client_threads.emplace_back(std::async(std::launch::async, ycsbc::ClientThread, dbs[i], &wl,
-                                             thread_ops, true, true, !do_transaction, &latch, nullptr));
+                                             thread_ops, true, true, !do_transaction, &latch,
+                                             static_cast<ycsbc::utils::RateLimiter *>(nullptr),
+                                             static_cast<std::atomic<bool> *>(nullptr)));
     }
     assert((int)client_threads.size() == num_threads);
 
@@ -172,7 +177,13 @@ int main(const int argc, const char *argv[]) {
     // rate file path for dynamic rate limiting, format "time_stamp_sec new_ops_per_second" per line
     std::string rate_file = props.GetProperty("limit.file", "");
 
-    const int total_ops = stoi(props[ycsbc::CoreWorkload::OPERATION_COUNT_PROPERTY]);
+    // maxexecutiontime > 0 enables time-bounded mode; operationcount is ignored.
+    const int max_execution_time = std::stoi(props.GetProperty("maxexecutiontime", "0"));
+    const int total_ops = (max_execution_time > 0)
+                              ? 0  // 0 = unlimited, client loops until stop_flag
+                              : stoi(props[ycsbc::CoreWorkload::OPERATION_COUNT_PROPERTY]);
+
+    std::atomic<bool> stop_flag{false};
 
     ycsbc::utils::CountDownLatch latch(num_threads);
     ycsbc::utils::Timer<double> timer;
@@ -183,13 +194,21 @@ int main(const int argc, const char *argv[]) {
       status_future = std::async(std::launch::async, StatusThread,
                                  measurements, &latch, status_interval);
     }
+
+    // Timeout thread: fires after maxexecutiontime seconds and signals all workers to stop.
+    std::future<void> timeout_future;
+    if (max_execution_time > 0) {
+      timeout_future = std::async(std::launch::async, [&stop_flag, max_execution_time]() {
+        std::this_thread::sleep_for(std::chrono::seconds(max_execution_time));
+        stop_flag.store(true, std::memory_order_relaxed);
+      });
+    }
+
     std::vector<std::future<int>> client_threads;
     std::vector<ycsbc::utils::RateLimiter *> rate_limiters;
     for (int i = 0; i < num_threads; ++i) {
-      int thread_ops = total_ops / num_threads;
-      if (i < total_ops % num_threads) {
-        thread_ops++;
-      }
+      int thread_ops = (total_ops > 0) ? (total_ops / num_threads + (i < total_ops % num_threads ? 1 : 0))
+                                       : 0;
       ycsbc::utils::RateLimiter *rlim = nullptr;
       if (ops_limit > 0 || rate_file != "") {
         int64_t per_thread_ops = ops_limit / num_threads;
@@ -197,7 +216,8 @@ int main(const int argc, const char *argv[]) {
       }
       rate_limiters.push_back(rlim);
       client_threads.emplace_back(std::async(std::launch::async, ycsbc::ClientThread, dbs[i], &wl,
-                                             thread_ops, false, !do_load, true, &latch, rlim));
+                                             thread_ops, false, !do_load, true, &latch, rlim,
+                                             (max_execution_time > 0) ? &stop_flag : nullptr));
     }
 
     std::future<void> rlim_future;
@@ -214,13 +234,21 @@ int main(const int argc, const char *argv[]) {
     }
     double runtime = timer.End();
 
+    if (max_execution_time > 0) {
+      timeout_future.wait();
+    }
     if (show_status) {
       status_future.wait();
     }
 
     std::cout << "Run runtime(sec): " << runtime << std::endl;
     std::cout << "Run operations(ops): " << sum << std::endl;
-    std::cout << "Run throughput(ops/sec): " << sum / runtime << std::endl;
+    std::cout << "Run throughput(ops/sec): "
+#ifdef USE_SQLITE
+              << (sum - static_cast<long long>(ycsbc::SqliteDB::BusyCount())) / runtime << std::endl;
+#else
+              << sum / runtime << std::endl;
+#endif
   }
 
   for (int i = 0; i < num_threads; i++) {
