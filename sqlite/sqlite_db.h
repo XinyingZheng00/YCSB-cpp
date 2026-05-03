@@ -85,10 +85,6 @@ class SqliteDB : public DB {
   std::string table_name_;
   bool use_begin_concurrent_;
   
-  uint64_t transaction_batch_size_;
-  uint64_t current_batch_count_;
-  bool transaction_active_;
-
   sqlite3_stmt *stmt_read_all_;
   sqlite3_stmt *stmt_scan_all_;
   sqlite3_stmt *stmt_update_all_;

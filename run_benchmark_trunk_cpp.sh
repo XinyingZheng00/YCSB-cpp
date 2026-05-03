@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run_benchmark_bcw2.sh — BCW2 (BEGIN CONCURRENT + WAL2) benchmark pipeline
+# run_benchmark_trunk_cpp.sh — Traditional SQLite (cpp binding, plain WAL + BEGIN) benchmark pipeline
 #
 #   Identical structure to run_benchmark_hctree.sh but uses the BCW2 configuration:
 #     - sqlite.hctree_mode=false  (no ?hctree=1, standard SQLite B-tree)
@@ -9,7 +9,7 @@
 #   fig2-multi-writer-local directory, tagged with "bcw2" instead of "hctree".
 #
 # Usage:
-#   ./run_benchmark_bcw2.sh [options]
+#   ./run_benchmark_trunk_cpp.sh [options]
 #
 # Options:
 #   --workloads "a b c d f"   Workload letters to run (default: "a")
@@ -23,11 +23,11 @@ YCSB_DIR="$(cd "$(dirname "$0")" && pwd)"
 # CONCURRENT patches, which is why earlier bcw2 runs silently fell back to
 # journal_mode=delete. Build via: bash $YCSB_DIR/build_bcw2.sh
 BCW2_BLD_DIR="${BCW2_BLD_DIR:-$HOME/bcw2/bld}"
-DB_PATH="${DB_PATH:-/tank/ycsb_data/bcw2_ycsb/bcw_ycsb.db}"
+DB_PATH="${DB_PATH:-/tank/ycsb_data/trunkcpp_ycsb/trunkcpp_ycsb.db}"
 mkdir -p "$(dirname "$DB_PATH")"
 CACHED_DB="$(dirname "$DB_PATH")/cached_$(basename "$DB_PATH")"
 RESULTS_DIR="/users/Xinying/ozonedb/bench/results/local/fig2-multi-writer-local"
-PROPS="$YCSB_DIR/sqlite/sqlite-bcw.properties"
+PROPS="$YCSB_DIR/sqlite/sqlite-trunk.properties"
 YCSB_BIN="$YCSB_DIR/ycsb"
 
 RECORD_COUNT=1000000
@@ -68,8 +68,8 @@ else
 fi
 
 # ---- Step 2: Build YCSB-cpp binary if needed --------------------------------
-# Single binary shared by run_benchmark_bcw2.sh and run_benchmark_hctree.sh.
-# Mode is selected at runtime by the properties file (sqlite-bcw.properties
+# Single binary shared by run_benchmark_trunk_cpp.sh and run_benchmark_hctree.sh.
+# Mode is selected at runtime by the properties file (sqlite-trunk.properties
 # vs hctree.properties), not by which binary is invoked.
 if [ ! -f "$YCSB_BIN" ] || \
    ! nm "$YCSB_BIN" 2>/dev/null | grep -q "NewSqliteDB" || \
@@ -117,7 +117,7 @@ for WL in $WORKLOADS; do
   WSHORT="workload${WL}"
 
   for T in $THREAD_COUNTS; do
-    RESULT_FILE="$RESULTS_DIR/1KB-dur${MAX_EXECUTION_TIME}s-${RECORD_COUNT}-${WSHORT}-bcw2_t${T}.result"
+    RESULT_FILE="$RESULTS_DIR/1KB-dur${MAX_EXECUTION_TIME}s-${RECORD_COUNT}-${WSHORT}-trunkcpp_t${T}.result"
 
     rm -f "$RESULT_FILE"
     echo "=== Workload $WL | $T thread(s) | $RUNS run(s) — output: $RESULT_FILE ===" | tee "$RESULT_FILE"
@@ -159,7 +159,7 @@ for WL in $WORKLOADS; do
 done
 
 echo ""
-echo "=== All BCW2 benchmarks complete. Results written to: $RESULTS_DIR ==="
+echo "=== All trunk-cpp benchmarks complete. Results written to: $RESULTS_DIR ==="
 echo ""
 echo "Quick summary (throughput lines):"
-grep -rE "Run throughput" "$RESULTS_DIR"/1KB-dur${MAX_EXECUTION_TIME}s-${RECORD_COUNT}-*-bcw2_t*.result 2>/dev/null || true
+grep -rE "Run throughput" "$RESULTS_DIR"/1KB-dur${MAX_EXECUTION_TIME}s-${RECORD_COUNT}-*-trunkcpp_t*.result 2>/dev/null || true

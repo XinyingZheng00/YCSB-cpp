@@ -25,18 +25,22 @@
 set -euo pipefail
 
 YCSB_DIR="$(cd "$(dirname "$0")" && pwd)"
-HCTREE_BLD_DIR="${HCTREE_BLD_DIR:-$HOME/hctree/bld}"
-DB_PATH="${DB_PATH:-/tmp/hctree_ycsb.db}"
+# Use the hctree-bedrock library (built by build_bcw2.sh) — it contains the
+# hctree storage engine AND the WAL2/BEGIN CONCURRENT patches, so a single
+# library and binary serve both bcw2 and hctree benchmarks.
+HCTREE_BLD_DIR="${HCTREE_BLD_DIR:-$HOME/bcw2/bld}"
+DB_PATH="${DB_PATH:-/tank/ycsb_data/hctree_ycsb/hctree_ycsb.db}"
+mkdir -p "$(dirname "$DB_PATH")"
 CACHED_DB="$(dirname "$DB_PATH")/cached_$(basename "$DB_PATH")"
 RESULTS_DIR="/users/Xinying/ozonedb/bench/results/local/fig2-multi-writer-local"
 PROPS="$YCSB_DIR/sqlite/hctree.properties"
 YCSB_BIN="$YCSB_DIR/ycsb"
 
 RECORD_COUNT=1000000
-MAX_EXECUTION_TIME=120
+MAX_EXECUTION_TIME=60
 WORKLOADS="a b c d f"
-THREAD_COUNTS="1 2 4 8"
-RUNS=2
+THREAD_COUNTS="1"
+RUNS=1
 DO_FLAMEGRAPH=0
 FLAMEGRAPH_THREADS=8
 
@@ -64,22 +68,29 @@ workload_file() {
 
 mkdir -p "$RESULTS_DIR"
 
-# ---- Step 1: Build HCTree library if needed ---------------------------------
+# ---- Step 1: Build SQLite library if needed ---------------------------------
+# hctree-bedrock branch: contains hctree storage engine + WAL2 + BEGIN
+# CONCURRENT in a single library. Used for BOTH bcw2 and hctree benchmarks.
 if [ ! -f "$HCTREE_BLD_DIR/libsqlite3_hctree.a" ]; then
-  echo "=== Building HCTree library ==="
-  bash "$YCSB_DIR/build_hctree.sh"
+  echo "=== Building SQLite library (hctree-bedrock) ==="
+  bash "$YCSB_DIR/build_bcw2.sh"
 else
-  echo "=== HCTree library already built at $HCTREE_BLD_DIR/libsqlite3_hctree.a ==="
+  echo "=== SQLite library already built at $HCTREE_BLD_DIR/libsqlite3_hctree.a ==="
 fi
 
 # ---- Step 2: Build YCSB-cpp binary if needed --------------------------------
+# Single binary shared by run_benchmark_bcw2.sh and run_benchmark_hctree.sh.
+# Mode is selected at runtime by the properties file (hctree.properties vs
+# sqlite-bcw.properties), not by which binary is invoked.
 if [ ! -f "$YCSB_BIN" ] || \
    ! nm "$YCSB_BIN" 2>/dev/null | grep -q "NewSqliteDB" || \
    [ "$YCSB_DIR/sqlite/sqlite_db.cc" -nt "$YCSB_BIN" ] || \
-   [ "$YCSB_DIR/sqlite/sqlite_db.h"  -nt "$YCSB_BIN" ]; then
-  echo "=== Building YCSB-cpp with HCTree backend ==="
+   [ "$YCSB_DIR/sqlite/sqlite_db.h"  -nt "$YCSB_BIN" ] || \
+   [ "$HCTREE_BLD_DIR/libsqlite3_hctree.a" -nt "$YCSB_BIN" ]; then
+  echo "=== Building YCSB-cpp ==="
   cd "$YCSB_DIR"
   rm -f "$YCSB_BIN"
+  make clean >/dev/null 2>&1 || true
   make BIND_SQLITE=1 BIND_HCTREE=1 HCTREE_BLD_DIR="$HCTREE_BLD_DIR" -j"$(nproc)"
 else
   echo "=== YCSB-cpp binary is up to date ==="

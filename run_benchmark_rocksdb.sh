@@ -25,16 +25,16 @@
 set -euo pipefail
 
 YCSB_DIR="$(cd "$(dirname "$0")" && pwd)"
-DB_PATH="${DB_PATH:-/tmp/rocksdb_ycsb}"
+DB_PATH="${DB_PATH:-/tank/ycsb_data/rocksdb_cpp_ycsb}"
 CACHED_DB="$(dirname "$DB_PATH")/cached_$(basename "$DB_PATH")"
-RESULTS_DIR="/users/Xinying/ozonedb/bench/results/local/fig2-multi-writer-local"
+RESULTS_DIR="${RESULTS_DIR:-/users/Xinying/ozonedb/bench/results/local/fig2-single-writer-local-cpp-binding-after-fix}"
 PROPS="$YCSB_DIR/rocksdb/rocksdb.properties"
 YCSB_BIN="$YCSB_DIR/ycsb"
 
 RECORD_COUNT=1000000
 MAX_EXECUTION_TIME=120
 WORKLOADS="a b c d f"
-THREAD_COUNTS="1 2 4 8"
+THREAD_COUNTS="1"
 RUNS=1
 DO_FLAMEGRAPH=0
 FLAMEGRAPH_THREADS=8
@@ -74,14 +74,31 @@ workload_file() {
 mkdir -p "$RESULTS_DIR"
 
 # ---- Step 1: Build YCSB-cpp binary if needed --------------------------------
+# Link against locally-built RocksDB 9.6.1 (matches the rocksjava version used
+# by the YCSB-Java side); fall back to system librocksdb if the prefix is
+# absent.
+ROCKSDB_PREFIX="${ROCKSDB_PREFIX:-/users/Xinying/rocksdb-9.6.1}"
+if [ -f "$ROCKSDB_PREFIX/lib/librocksdb.so" ]; then
+  export LD_LIBRARY_PATH="$ROCKSDB_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  ROCKSDB_CXXFLAGS="-I$ROCKSDB_PREFIX/include"
+  ROCKSDB_LDFLAGS="-L$ROCKSDB_PREFIX/lib -Wl,-rpath,$ROCKSDB_PREFIX/lib"
+else
+  ROCKSDB_CXXFLAGS=""
+  ROCKSDB_LDFLAGS=""
+fi
+
 if [ ! -f "$YCSB_BIN" ] || \
    ! nm "$YCSB_BIN" 2>/dev/null | grep -q "NewRocksdbDB" || \
    [ "$YCSB_DIR/rocksdb/rocksdb_db.cc" -nt "$YCSB_BIN" ] || \
-   [ "$YCSB_DIR/rocksdb/rocksdb_db.h"  -nt "$YCSB_BIN" ]; then
+   [ "$YCSB_DIR/rocksdb/rocksdb_db.h"  -nt "$YCSB_BIN" ] || \
+   { [ -n "$ROCKSDB_CXXFLAGS" ] && ! ldd "$YCSB_BIN" 2>/dev/null | grep -q "$ROCKSDB_PREFIX/lib/librocksdb"; }; then
   echo "=== Building YCSB-cpp with RocksDB backend ==="
   cd "$YCSB_DIR"
   rm -f "$YCSB_BIN"
-  make BIND_ROCKSDB=1 -j"$(nproc)"
+  make BIND_ROCKSDB=1 \
+       EXTRA_CXXFLAGS="$ROCKSDB_CXXFLAGS" \
+       EXTRA_LDFLAGS="$ROCKSDB_LDFLAGS" \
+       -j"$(nproc)"
 else
   echo "=== YCSB-cpp binary is up to date ==="
 fi

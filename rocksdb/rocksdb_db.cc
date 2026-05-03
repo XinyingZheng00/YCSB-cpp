@@ -15,6 +15,7 @@
 #include <rocksdb/cache.h>
 #include <rocksdb/filter_policy.h>
 #include <rocksdb/merge_operator.h>
+#include <rocksdb/statistics.h>
 #include <rocksdb/status.h>
 #include <rocksdb/utilities/options_util.h>
 #include <rocksdb/write_batch.h>
@@ -129,11 +130,15 @@ namespace {
   const std::string PROP_PER_OP_DB_RETRY_BASE_US = "rocksdb.per_op_db_retry_base_us";
   const std::string PROP_PER_OP_DB_RETRY_BASE_US_DEFAULT = "1000";
 
+  const std::string PROP_STATISTICS = "rocksdb.statistics";
+  const std::string PROP_STATISTICS_DEFAULT = "false";
+
   static std::shared_ptr<rocksdb::Env> env_guard;
   static std::shared_ptr<rocksdb::Cache> block_cache;
 #if ROCKSDB_MAJOR < 8
   static std::shared_ptr<rocksdb::Cache> block_cache_compressed;
 #endif
+  static std::shared_ptr<rocksdb::Statistics> stats_;
 } // anonymous
 
 namespace ycsbc {
@@ -305,6 +310,10 @@ void RocksdbDB::Cleanup() {
     fprintf(stderr,
             "RocksDB per-op mode: %" PRIu64 " total lock-contention retries across all threads\n",
             retries);
+  }
+  if (stats_) {
+    fprintf(stderr, "=== RocksDB statistics ===\n%s\n", stats_->ToString().c_str());
+    stats_.reset();
   }
   per_op_opts_ready_ = false;
   for (size_t i = 0; i < cf_handles_.size(); i++) {
@@ -568,9 +577,19 @@ void RocksdbDB::GetOptions(const utils::Properties &props, rocksdb::Options *opt
     if (props.GetProperty(PROP_OPTIMIZE_LEVELCOMP, PROP_OPTIMIZE_LEVELCOMP_DEFAULT) == "true") {
       opt->OptimizeLevelStyleCompaction();
     }
-    if (props.GetProperty(PROP_SYNC, PROP_SYNC_DEFAULT) == "true") {
-      wopt_.sync = true;
+  }
+
+  // sync is a WriteOptions setting, not a DB option, so honor it regardless of
+  // whether DB options came from rocksdb.optionsfile or the inline properties.
+  if (props.GetProperty(PROP_SYNC, PROP_SYNC_DEFAULT) == "true") {
+    wopt_.sync = true;
+  }
+
+  if (props.GetProperty(PROP_STATISTICS, PROP_STATISTICS_DEFAULT) == "true") {
+    if (!stats_) {
+      stats_ = rocksdb::CreateDBStatistics();
     }
+    opt->statistics = stats_;
   }
 }
 

@@ -186,8 +186,12 @@ void SqliteDB::OpenDB() {
     throw utils::Exception("SQLite db path is missing");
   }
 
-  // Check if requested VFS is available before opening
-  const char *vfs_name = "unix-excl";
+  // VFS is configurable so multi-process shared-DB experiments can use the
+  // default "unix" VFS (which uses POSIX advisory locks and supports
+  // concurrent multi-process access). The default "unix-excl" preserves the
+  // previous behavior for single-process multi-thread runs.
+  std::string vfs_prop = props_->GetProperty("sqlite.vfs", "unix-excl");
+  const char *vfs_name = vfs_prop.c_str();
   sqlite3_vfs *requested_vfs = sqlite3_vfs_find(vfs_name);
   sqlite3_vfs *default_vfs = sqlite3_vfs_find(nullptr);
   
@@ -216,6 +220,15 @@ void SqliteDB::OpenDB() {
   if (rc != SQLITE_OK) {
     throw utils::Exception(std::string("Init open: ") + sqlite3_errmsg(db_));
   }
+
+  // Apply busy_timeout immediately via the C API so subsequent PRAGMAs and
+  // CREATE TABLE retry on SQLITE_BUSY (rather than failing immediately).
+  // Without this, multi-process shared-DB init races on cache_size /
+  // journal_mode setup. The PRAGMA busy_timeout below applies the same value
+  // again — both are idempotent.
+  int early_busy_timeout = std::stoi(
+      props_->GetProperty(PROP_BUSY_TIMEOUT, PROP_BUSY_TIMEOUT_DEFAULT));
+  sqlite3_busy_timeout(db_, early_busy_timeout);
   
   
   // Verify which VFS was actually used by checking the database filename
